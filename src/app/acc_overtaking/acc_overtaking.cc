@@ -19,6 +19,10 @@ using namespace std::chrono;
 float oldSensorRearLeft;
 float mDistance = 0.0;
 float distanceTreshold = 0.0;
+double steerValue = 0.0;
+double oldSteerValue = 0.0;
+double distanceMqtt;
+double steeringMqtt;
 float oldSensorFront;
 float timeRequestResponded;
 float timeRequestStarted;
@@ -29,7 +33,9 @@ bool isMeasuringSpeed;
 int speedOfCarInFront;
 int size;
 bool accActive;
-bool isAutonomous;
+bool isAutonomous = true; // should be set to false initial, but a by the broker persisted toggleAutonomous command in my setup forces to init with true
+bool isOvertaking = false;
+int desired_speed = -1;
 bool autonomousWasDisabled;
 vector<int> speedMeasurements; //change to stack?
 vector<int> fallbackPoints;
@@ -122,7 +128,6 @@ acc_overtaking::acc_overtaking(const char* id) : mosquittopp(id)
 
 		/* calculate commanddataout */
 		cdo = followDriving(this->sdi);
-		// driving(this->sdi);
 
 		/* publish */
 		snprintf(val, sizeof(val), "%f", cdo.steer);
@@ -151,26 +156,28 @@ acc_overtaking::acc_overtaking(const char* id) : mosquittopp(id)
 /* TODO */
 acc_overtaking::~acc_overtaking() {
 }
-
-CommandDataOut acc_overtaking::driving(SensorDataIn sdi) {
+/**
+ * taken from the android app, adapted but never really tested, 
+ * this should be tested and finished with a stable setup without graphic freezes!
+ **/
+CommandDataOut acc_overtaking::doOvertaking(SensorDataIn sdi) {
 	CommandDataOut cd = {0};
-
 	if(!sdi.isPositionTracked)
 	{
 		return cd;
 	}
-	int sensorFront = 50;
-	// Sensor Front
-    if (sensorFront != 100.0 && oldSensorFront != 100.0 && sensorFront != -1.0 && oldSensorFront != -1.0) {
-        if (sensorFront != oldSensorFront) {
-            if (isMeasuringSpeed) {
+    if (sdi.middleFront != 100.0 && oldSensorFront != 100.0 && sdi.middleFront != -1.0 && oldSensorFront != -1.0) {
+        if (sdi.middleFront != oldSensorFront) {
+            if (sdi.isSpeedTracked) {
+				/**
+				 * this uses the camera distance to calculate the speed of the car in front, unless it s stable it s better to use the game sensor
                 // time passed in seconds
                 //timeRequestResponded = System.currentTimeMillis();
                 const float time = (timeRequestResponded - timeRequestStarted) * 0.001;
                 // distance covered by argos vehicle in m
                 const int travelled = time * sdi.ownSpeed / 3.6;
                 // distance covered by the vehicle in front
-                const float delta = travelled - (oldSensorFront - sensorFront);
+                const float delta = travelled - (oldSensorFront - sdi.middleFront);
                 const float speed = (delta / time) * 3.6;
 
                 int finalSpeed = 0;
@@ -189,36 +196,38 @@ CommandDataOut acc_overtaking::driving(SensorDataIn sdi) {
                     isMeasuringSpeed = false;
                     speedOfCarInFront = (int) average(speedMeasurements);
                 }
+				*/
+				// speed up to a faster speed than the leading car
+				if (sdi.leadSpeed > sdi.ownSpeed){
+					cd.accel = 0.5 * (sdi.leadSpeed - sdi.ownSpeed + 5);
+				} else { // no need to speed up further
+					cd.accel = 0.0;
+				}
+				
             }
         }
     }
-    if (sensorFront >= 12 && 15 >= sensorFront && !readyToOvertake) {
-        if (sensorLeftFront < 50 || sensorLeftMid < 50) {
+	// the vectors coming from the simulation need to be normalized, not yet done!
+   /* if (sdi.middleFront >= 12 && 15 >= sdi.middleFront && !readyToOvertake) {
+        if (sdi.cornerFrontLeft < 50 || sdi.cornerRearLeft < 50) {
             // car in middle lane, speed measured, active acc
-            if (!accActive && speedOfCarInFront != 0) {
-                adaptiveCruiseControl();
+            if (!accActive && sdi.leadSpeed != 0) {
+				return ;
             }
-        } else if (speedOfCarInFront < sdi.ownSpeed) {
-            overtakeManoeuvre();
+        } else if (sdi.leadSpeed < sdi.ownSpeed) {
+			readyToOvertake = true; // is overtaking now
+            // switch to left lane
+			cd.steer = -0.5
         }
-
     }
-
-
-	/*
-		// SensorRearRight
-		if (sdi.cornerRearRight >= 3 && 29 >= sdi.cornerRearRight) {
-		if (readyToOvertake) {
-			// finishOvertakeManoeuvre()
-		}
-	}
-	 */
-
-
-
-	//calculate distance
-	float distance = 18.5;
-	checkOverTaking(distance, sdi.ownSpeed);
+	if (sdi.middleFront = 0 && readyToOvertake){
+		if (sdi.cornerRearRight < 50 && sdi.cornerFrontRight < 50) {
+			readyToOvertake = false; // stop overtaking now
+			// switch to right lane
+			cd.steer = 0.5
+		}		    
+	}*/
+	return cd;
 }
 
 /**
@@ -231,7 +240,6 @@ void acc_overtaking::myPublish(const char *type, const char *value) {
 	char topic[1024];
 	strcpy(topic, "ecu/acc/");
 	strncat(topic, type, sizeof(topic));
-	//FrontCamera/steeringData
 	publish(NULL, topic, strlen(value), value);
 }
 
@@ -242,71 +250,90 @@ void acc_overtaking::on_message(const struct mosquitto_message *message)
 
 	/* get pointer to payload for convenience */
 	char *value = (char *)message->payload;
-	// unknown payload: distance: 0.0; direction: -1
 
-	Genode::log("the payload is: ", (const char *)message->payload);
-	Genode::log("the topic is: ", (const char *)message->topic);
+	// Genode::log("the payload is: ", (const char *)message->payload);
+	// Genode::log("the topic is: ", (const char *)message->topic);
 
 	/* split x,y into two separate values */
 	// strstr Returns a pointer to the first occurrence of str2 in str1, or a null pointer if str2 is not part of str1.
 	// strtok string delimiters splits string in single words
-	float x = 5.5, y = 5.6;
-	if (strstr(value, ":")) {
-		x = atof(strtok(value, ";"));
-		Genode::log("x is: ", x);
+	float x = 0.0, y = 0.0;
+	if (strstr(value, ",")) {
+		x = atof(strtok(value, ","));
 		y = atof(strtok(NULL, ","));
-		Genode::log("y is: ", x);
-
 	}
 
-	if (!strcmp(value, "distance")){
+	if(!strcmp((const char *)message->topic, "FrontCamera/sensorOff")){
+		Genode::log("Sensor is going offline");
+		isAutonomous = false;
+		return;
+	}
+	if(!strcmp((const char *)message->topic, "FrontCamera/setSpeed")){
+		Genode::log("setting speed");
+		desired_speed = (atoi((const char *)message->payload))/3.6;
+		return;
+	} else if(!strcmp((const char *)message->topic, "FrontCamera/toggleAutonomous")){
+		Genode::log("toggling autonomous");
+		toggleAutonomous();
+		return;
+	} else if (!strcmp((const char *)message->topic, "FrontCamera/steeringData")){
 		Genode::log("steeringData is: ", (const char *)message->payload);
+		steeringMqtt = atof(value);
+		sdi.steeringValue = steeringMqtt;
+		return;
+	} else if  (!strcmp((const char *)message->topic, "FrontCamera/distance")){
+		Genode::log("distance is: ", (const char *)message->payload);
+		distanceMqtt = atof(value);
+		sdi.middleFront = distanceMqtt;
+		return;
 	} else
 	/* fill sensorDataIn struct */
 	if (!strcmp(type, "isPositionTracked")) {
-		Genode::log("steeringData is: ", *value);
+		//Genode::log("isPositionTracked is: ", *value);
 		sdi.isPositionTracked = atoi(value);
 	} else if (!strcmp(type, "isSpeedTracked")) {
-		Genode::log("steeringData is: ", *value);
+		Genode::log("isSpeedTracked is: ", *value);
 		sdi.isSpeedTracked = atoi(value);
 	} else if (!strcmp(type, "leadPos")) {
-		Genode::log("steeringData is: ", *value);
+		//Genode::log("leadPos is: ", *value);
 		sdi.leadPos = vec2(x, y);
 	} else if (!strcmp(type, "ownPos")) {
-		Genode::log("steeringData is: ", *value);
+		Genode::log("ownPos is: ", *value);
 		sdi.ownPos = vec2(x, y);
 	} else if (!strcmp(type, "cornerFrontRight")) {
 		sdi.cornerFrontRight = vec2(x, y);
-		Genode::log("steeringData is: ", *value);
+		//Genode::log("cornerFrontRight is: ", *value);
 	} else if (!strcmp(type, "cornerFrontLeft")) {
 		sdi.cornerFrontLeft = vec2(x, y);
-		Genode::log("steeringData is: ", *value);
+		//Genode::log("cornerFrontLeft is: ", *value);
 	} else if (!strcmp(type, "cornerRearLeft")) {
 		sdi.cornerRearLeft = vec2(x, y);
-		Genode::log("steeringData is: ", *value);
+		//Genode::log("cornerRearLeft is: ", *value);
 	} else if (!strcmp(type, "cornerRearRight")) {
 		sdi.cornerRearRight = vec2(x, y);
-		Genode::log("steeringData is: ", *value);
+		//Genode::log("cornerRearRight is: ", *value);
 	} else if (!strcmp(type, "leadSpeed")) {
 		sdi.leadSpeed = atof(value);
-		Genode::log("steeringData is: ", *value);
+		Genode::log("leadSpeed is: ", *value);
 	} else if (!strcmp(type, "ownSpeed")) {
 		sdi.ownSpeed = atof(value);
-		Genode::log("steeringData is: ", *value);
+		Genode::log("ownSpeed is: ", *value);
 	} else if (!strcmp(type, "curGear")) {
 		sdi.curGear = atoi(value);
-		Genode::log("steeringData is: ", *value);
+		//Genode::log("curGear is: ", *value);
 	} else if (!strcmp(type, "steerLock")) {
 		sdi.steerLock = atof(value);
-		Genode::log("steeringData is: ", *value);
+		//Genode::log("steerLock is: ", *value);
 	} else {
-		Genode::log("unknown topic: ", (const char *)message->topic);
+		//Genode::log("unknown topic: ", (const char *)message->topic);
 		return;
 	}
 
+
 	/* check if we got all values */
 	sem_wait(&allValSem);
-	allValues = (allValues + 1) % 12;
+	Genode::log("allValues is ",allValues);
+	allValues = (allValues + 1) % 12; // 13
 	if (!allValues) {
 		sem_post(&allData);
 	}
@@ -322,6 +349,7 @@ void acc_overtaking::on_disconnect(int rc)
 {
 	Genode::log("disconnect from mosquitto server");
 }
+
 
 /**
  * calculates the gear
@@ -349,6 +377,27 @@ int acc_overtaking::getSpeedDepGear(float speed, int currentGear)
 }
 
 /**
+ * 
+ **/
+bool acc_overtaking::checkOvertaking(SensorDataIn sd){
+    double mFastSpeed = 40.0;
+    int distanceTreshHold;
+
+    if (sd.middleFront < 10 && sd.ownSpeed >= mFastSpeed && mDistance != sd.middleFront && !isOvertaking) {
+        distanceTreshHold++;
+    }
+    mDistance = sd.middleFront;
+    if (distanceTreshHold >= 12) {
+        distanceTreshHold = 0.0;
+        isOvertaking = true; 
+        int timePassed = 0;
+		return true;
+    } else {
+		return false;
+	}
+};
+
+/**
  * calculates command data for the next simulation step
  * based on the sensor data from the previous step
  *
@@ -371,6 +420,7 @@ CommandDataOut acc_overtaking::followDriving(SensorDataIn sd)
 	{
 		return cd;
 	}
+
 	vec2 curLeadPos = sd.leadPos;
 	vec2 ownPos = sd.ownPos;
 
@@ -389,12 +439,29 @@ CommandDataOut acc_overtaking::followDriving(SensorDataIn sd)
 
 	// printf("CROSS: %f\n", axis.fakeCrossProduct(&leadVec));
 	// printf("ANGLE: %f\n", RAD2DEG(asin(axis.fakeCrossProduct(&leadVec))));
-
+	
 	const float cross = axis.fakeCrossProduct(&leadVec);
 	const float dot = axis * leadVec;
 	const float angle = std::atan2(cross, dot) / sd.steerLock / 2.0;
+	Genode::log("followDriving autonomous is ", isAutonomous);
+	if(isAutonomous && sd.middleFront != 0){
+		Genode::log("followDriving distance is ", sd.middleFront);
+		cd.steer = steerForLaneKeeping(sd.middleFront, sd.steeringValue);
+	/*	if (checkOvertaking(sd)) {
+			cd = doOvertaking(sd);
+			if (!cd) {
+				// overtaking not possible, doOvertaking returns empty!
+				cd.steer = angle;
+			} else {
+				//doing the overtaking
+				return cd;
+			}
+		}*/
+	} else {
+		cd.steer = angle; // Set steering angle
+	}
+	Genode::log("followDriving steering angle is ", cd.steer);
 
-	cd.steer = angle; // Set steering angle
 
 	// Only possible to calculate accel and brake if speed of leading car known
 	if(!sd.isSpeedTracked) // If position of leading car known in last frame
@@ -420,12 +487,27 @@ CommandDataOut acc_overtaking::followDriving(SensorDataIn sd)
 	// Äquivalent to accel but the other way round
 	//float b = std::max<float>(0, std::min<float>(g_maxBrake, std::sqrt(g_maxBrake * (adist - dist) / adist)));
 	float dv = (lspeed - fspeed);
-	if (dv > 0.0 && dist > 5.0)
-	{
+	/**
+	 * if desiredSpeed != -1 the user set a speed value over the phone
+	 * therefore we need to accelerate if we are not fast enough yet or brake if we are to fast
+	 **/
+	if (desired_speed != -1 && dist > 5.0){
+		dv = (desired_speed - fspeed);
+		if (desired_speed > fspeed) {
+			cd.accel = 0.5 * dv;
+			Genode::log("followDriving speed set by user ", cd.accel);
+
+		} else if (desired_speed < fspeed){
+			cd.brakeFL = cd.brakeFR = cd.brakeRL = cd.brakeRR = -0.5 * dv;
+		} else {
+			/* speed was reached, reset to -1
+			 * remove this else {} if speed should be kept!
+			 */
+			desired_speed = -1;
+		}		
+	}else if (dv > 0.0 && dist > 5.0){
 		cd.accel = 0.5 * dv;
-	}
-	else if (dist < 30.0)
-	{
+	} else if (dist < 30.0 && !isAutonomous){
 		cd.brakeFL = cd.brakeFR = cd.brakeRL = cd.brakeRR = -0.5 * dv;
 	}
 	//char format[256];
@@ -435,104 +517,33 @@ CommandDataOut acc_overtaking::followDriving(SensorDataIn sd)
 	// Individual brake commands for each wheel
 
 	cd.gear = getSpeedDepGear(sd.ownSpeed, sd.curGear);
+	Genode::log("followDriving cd.gear is ", cd.gear);
 
 	return cd;
 }
 
-void acc_overtaking::checkOverTaking(float distance, float mSpeed){
-    double mSlowSpeed = 20.0;
-    double mFastSpeed = 50.0;
-    bool isOvertaking = false;
-    int distanceTreshHold;
 
-    if (distance < 10 && mSpeed >= mFastSpeed && mDistance != distance && !isOvertaking) {
-        distanceTreshHold++;
-    }
-    mDistance = distance;
-    if (distanceTreshHold >= 12) {
-        distanceTreshHold = 0.0;
 
-            /* move left 
-            * print the lane
-            */
-        isOvertaking = true; 
-        int timePassed = 0;
-        while (isOvertaking) {
-            /* getDistance, sensorDistance 
-                    Thread.sleep(250)
-                    timePassed += 250
-            */
-            float sensorDistance;
-            if ((sensorDistance < 20 && sensorDistance > 5 )|| timePassed > 20 * 1000) {
-                isOvertaking = false;
-            }
-		}
-        /* moveRight overtaking is over or not possible */
-    }
-};
 
 float acc_overtaking::average(vector<int> vec){
 	float average = accumulate( vec.begin(), vec.end(), 0.0)/vec.size();
 	return average;
 };
 
-void acc_overtaking::overtakeManoeuvre() {
-    readyToOvertake = true;
-    disableAutonomous();
-    /* Move Left */
-};
-
-void acc_overtaking::finishOvertakeManoeuvre() {
-    /* MOVE_RIGHT */
-    readyToOvertake = false;
-    accActive = false;
-    /* delay 4000 */
-    enableAutonomous();
-};
-
-void acc_overtaking::adaptiveCruiseControl() {
-
-    // if estimated speed of car in front is less or equal to, we assume that it is not moving
-    if (speedOfCarInFront >= 0 && 10 >= speedOfCarInFront) {
-            speedOfCarInFront = 0;
-            /* SET_SPEED 0.0 */
-            /*  SET_BRAKE 1.0 */
-
-            // delay 3000
-            /* SET_BRAKE 0.0 */
-    } else if (speedOfCarInFront >= 10 && sdi.ownSpeed >= speedOfCarInFront) {
-        /* SET_SPEED 2*speedOfCarInFront */
-    }
-    accActive = true;
-}
-
-void acc_overtaking::disableAutonomous() {
-    if (isAutonomous) {
-        /* SET_STEER 0.0 */
-        /* TOGGLE_AUTONOMOUS */
-        autonomousWasDisabled = true;
-    }
-};
-
-void acc_overtaking::enableAutonomous() {
-    if (!isAutonomous && autonomousWasDisabled) {
-        toggleAutonomous();
-        autonomousWasDisabled = false;
-    }
-};
-
-void acc_overtaking::steerForLaneKeeping(double distance, int steerDirection) {
-    double steerValue = 0.0;
+double acc_overtaking::steerForLaneKeeping(double distance, int steerDirection) {
+	Genode::log("steerForLaneKeeping distance ", distance);
+	Genode::log("steerForLaneKeeping steeringDirection ", steerDirection);
     const double absDistance = abs(distance);
+	oldSteerValue = steerValue;
     if (fallbackPoints.size() >= 2) {
         const double prevDistance = fallbackPoints.back(); 
-        //fallbackPoints.remove()
-        //fallbackPoints.remove()
+        fallbackPoints.pop_back();
+        fallbackPoints.pop_back();
         const double delta = absDistance - prevDistance;
         // distance inreased from old val
         // try to do a sharper steer
         if (absDistance >= 13) {
-                if (delta >= -2 && 2 >= delta) {return;}
+                if (delta >= -2 && 2 >= delta) {return oldSteerValue;}
                 if (delta >= 2 && 10 >= delta) {steerValue += (0.04 * steerDirection);}
                 if (delta >= 10 && 20 >= delta) {steerValue += (0.05 * steerDirection);}
                 if (delta >= 20 && 30 >= delta) {steerValue += (0.06 * steerDirection);}
@@ -556,18 +567,15 @@ void acc_overtaking::steerForLaneKeeping(double distance, int steerDirection) {
     if (distance >= -4 && 4 >= distance) {
         steerValue = 0.0;
     }
-    if (absDistance >= 300 && isAutonomous) {
-        toggleAutonomous();
-        return;
-    }
-
     fallbackPoints.push_back(absDistance);
-    /* STEER steerValue */
+	Genode::log("steerForLaneKeeping angle ", steerValue);
+	return steerValue;
 }
 
 void acc_overtaking::toggleAutonomous() {
-    /*steerValue = 0.0
-    postRequest(STEER, Pair("steer", 0.0))
-    postRequest(TOGGLE_AUTONOMOUS, null)
-	*/
+	if(isAutonomous) {
+		isAutonomous = false;
+	} else {
+		isAutonomous = true;
+	}
 }

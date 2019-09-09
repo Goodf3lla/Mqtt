@@ -7,6 +7,8 @@ typedef v2t<float> vec2;
 
 struct SensorDataIn
 {
+    float middleFront;
+    float steeringValue;
     bool isPositionTracked;
     bool isSpeedTracked;
     vec2 leadPos;

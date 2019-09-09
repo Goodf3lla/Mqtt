@@ -1,5 +1,5 @@
 #include <mosquittopp.h>
-#include <acc/types.h>
+#include <acc_overtaking/types.h>
 #include <semaphore.h>
 #include <vector>
 
@@ -38,14 +38,9 @@ private:
 	void on_disconnect(int rc);
 	void on_message(const struct mosquitto_message *message);
 	int getSpeedDepGear(float speed, int currentGear);
-	CommandDataOut driving(SensorDataIn sdi);
-	void checkOverTaking(float distance, float mSpeed);
-	void overtakeManoeuvre();
-	void finishOvertakeManoeuvre();
-	void adaptiveCruiseControl();
-	void disableAutonomous();
-	void enableAutonomous();
-	void steerForLaneKeeping(double distance, int steerDirection);
+	CommandDataOut doOvertaking(SensorDataIn sdi);
+	bool checkOvertaking(SensorDataIn sdi);
+	double steerForLaneKeeping(double distance, int steerDirection);
 	void toggleAutonomous();
 	CommandDataOut followDriving(SensorDataIn sd);
 	void myPublish(const char *type, const char *value);
